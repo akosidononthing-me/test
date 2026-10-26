@@ -1,31 +1,185 @@
-'use strict';
-const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');
-const port=Number(process.env.PORT)||3000;
-const clients=new Map();
-function send(res,code,data,type='application/json'){res.writeHead(code,{'Content-Type':type,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(type==='application/json'?JSON.stringify(data):data)}
-function publish(to,msg){const c=clients.get(to);if(c){c.write(`data: ${JSON.stringify(msg)}\n\n`);return true}return false}
-const server=http.createServer((req,res)=>{
- const u=new URL(req.url,'http://localhost');
- if(req.method==='GET'&&u.pathname==='/events'){
-  const role=u.searchParams.get('role');if(!['admin','client'].includes(role))return send(res,400,{error:'Invalid role'});
-  res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-cache, no-transform','Connection':'keep-alive','X-Accel-Buffering':'no'});
-  const old=clients.get(role);if(old)old.end();clients.set(role,res);
-  res.write(`data: ${JSON.stringify({type:'ready',role})}\n\n`);
-  publish(role==='admin'?'client':'admin',{type:'peer-online',role});
-  const timer=setInterval(()=>res.write(': ping\n\n'),20000);
-  req.on('close',()=>{clearInterval(timer);if(clients.get(role)===res){clients.delete(role);publish(role==='admin'?'client':'admin',{type:'peer-offline',role})}});return;
- }
- if(req.method==='POST'&&u.pathname==='/signal'){
-  let data='';req.on('data',c=>{data+=c;if(data.length>100000){req.destroy()}});req.on('end',()=>{
-   try{const m=JSON.parse(data);if(!['admin','client'].includes(m.from)||!['offer','answer','candidate','bye','hello'].includes(m.type))return send(res,400,{error:'Invalid signal'});
-    const delivered=publish(m.from==='admin'?'client':'admin',m);send(res,200,{delivered});
-   }catch{send(res,400,{error:'Invalid JSON'})}
-  });return;
- }
- if(req.method==='GET'){
-  const pages={'/':'admin.html','/admin':'admin.html','/client':'client.html','/common.js':'common.js'};
-  const file=pages[u.pathname];if(!file)return send(res,404,{error:'Not found'});
-  return fs.readFile(path.join(__dirname,'public',file),(err,b)=>err?send(res,500,{error:'Read error'}):send(res,200,b,file.endsWith('.js')?'application/javascript; charset=utf-8':'text/html; charset=utf-8'));
- }
- send(res,405,{error:'Method not allowed'});
-});server.listen(port,'0.0.0.0',()=>console.log('OnTour camera test listening on '+port));
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const { WebSocketServer, WebSocket } = require('ws');
+
+const PUBLIC_DIR = path.join(__dirname, 'public');
+
+const MIME_TYPES = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json'
+};
+
+const server = http.createServer((req, res) => {
+  let reqUrl = req.url.split('?')[0];
+  let filePath = path.join(PUBLIC_DIR, reqUrl === '/' ? 'index.html' : reqUrl);
+
+  if (!filePath.startsWith(PUBLIC_DIR)) {
+    res.writeHead(403, { 'Content-Type': 'text/plain' });
+    res.end('403 Forbidden');
+    return;
+  }
+
+  const ext = path.extname(filePath).toLowerCase();
+  const contentType = MIME_TYPES[ext] || 'application/octet-stream';
+
+  fs.readFile(filePath, (err, content) => {
+    if (err) {
+      if (err.code === 'ENOENT') {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('404 Not Found');
+      } else {
+        res.writeHead(500, { 'Content-Type': 'text/plain' });
+        res.end('500 Internal Server Error');
+      }
+    } else {
+      res.writeHead(200, { 'Content-Type': contentType });
+      res.end(content, 'utf-8');
+    }
+  });
+});
+
+const wss = new WebSocketServer({ server, maxPayload: 65536 });
+
+// Map<roomCode, { adminId: string, peers: Map<peerId, { ws, role }> }>
+const rooms = new Map();
+
+function generatePeerId() {
+  return Math.random().toString(36).substring(2, 10);
+}
+
+const send = (ws, msg) => {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(msg));
+  }
+};
+
+wss.on('connection', ws => {
+  let currentRoom = null;
+  let currentPeerId = null;
+
+  ws.on('message', buffer => {
+    let data;
+    try { data = JSON.parse(String(buffer)); } catch { return; }
+
+    const { type, room, target, payload } = data;
+
+    if (type === 'create-room') {
+      const roomCode = String(room || '').trim();
+      if (!/^[a-zA-Z0-9_-]{4,64}$/.test(roomCode)) {
+        return send(ws, { type: 'error', message: 'Room code must be 4–64 letters or numbers' });
+      }
+      if (rooms.has(roomCode)) {
+        return send(ws, { type: 'error', message: 'Room already exists. Choose a different room code or join as client.' });
+      }
+
+      currentPeerId = 'admin_' + generatePeerId();
+      currentRoom = roomCode;
+
+      const roomData = {
+        adminId: currentPeerId,
+        peers: new Map()
+      };
+      roomData.peers.set(currentPeerId, { ws, role: 'admin' });
+      rooms.set(roomCode, roomData);
+
+      send(ws, {
+        type: 'created',
+        peerId: currentPeerId,
+        room: roomCode,
+        role: 'admin',
+        peers: []
+      });
+      return;
+    }
+
+    if (type === 'join-room') {
+      const roomCode = String(room || '').trim();
+      if (!rooms.has(roomCode)) {
+        return send(ws, { type: 'error', message: 'Room does not exist. Only an admin can create a room.' });
+      }
+
+      const roomData = rooms.get(roomCode);
+      if (roomData.peers.size >= 4) {
+        return send(ws, { type: 'error', message: 'Room is full (maximum 4 participants allowed).' });
+      }
+
+      currentPeerId = 'client_' + generatePeerId();
+      currentRoom = roomCode;
+
+      const existingPeers = Array.from(roomData.peers.entries()).map(([id, info]) => ({
+        peerId: id,
+        role: info.role
+      }));
+
+      roomData.peers.set(currentPeerId, { ws, role: 'client' });
+
+      send(ws, {
+        type: 'joined',
+        peerId: currentPeerId,
+        room: roomCode,
+        role: 'client',
+        peers: existingPeers
+      });
+
+      for (const [id, peerInfo] of roomData.peers) {
+        if (id !== currentPeerId) {
+          send(peerInfo.ws, {
+            type: 'peer-joined',
+            peerId: currentPeerId,
+            role: 'client'
+          });
+        }
+      }
+      return;
+    }
+
+    if (['offer', 'answer', 'candidate'].includes(type)) {
+      if (!currentRoom || !rooms.has(currentRoom)) return;
+      const roomData = rooms.get(currentRoom);
+      const targetPeer = roomData.peers.get(target);
+      if (targetPeer) {
+        send(targetPeer.ws, {
+          type,
+          sender: currentPeerId,
+          payload
+        });
+      }
+      return;
+    }
+
+    if (type === 'hangup') {
+      leaveRoom();
+    }
+  });
+
+  function leaveRoom() {
+    if (!currentRoom || !rooms.has(currentRoom)) return;
+    const roomData = rooms.get(currentRoom);
+    roomData.peers.delete(currentPeerId);
+
+    for (const [id, peerInfo] of roomData.peers) {
+      send(peerInfo.ws, {
+        type: 'peer-left',
+        peerId: currentPeerId
+      });
+    }
+
+    if (roomData.peers.size === 0) {
+      rooms.delete(currentRoom);
+    }
+    currentRoom = null;
+    currentPeerId = null;
+  }
+
+  ws.on('close', () => {
+    leaveRoom();
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Admin-Client Web App & Signaling Server running on port ${PORT}`);
+});
